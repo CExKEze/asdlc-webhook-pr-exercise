@@ -53,6 +53,7 @@ pre{background:#1e1a2e;color:#e8e4f0;padding:14px 16px;border-radius:10px;overfl
 
   <div class="card">
     <h2>Recent logs (scrubbed)</h2>
+    <p style="font-size:13.5px;color:var(--muted);margin-bottom:8px">These logs are from <strong style="color:var(--ink)">production after PR #1842 shipped</strong> — not pre-merge. Use them as evidence of the live symptoms.</p>
     <pre>10:14:02 INFO  webhook.received tenant=acme delivery_id=d-1001 event=case.opened
 10:14:02 WARN  webhook.signature skipped=true reason=ALLOW_INSECURE_WEBHOOKS
 10:14:02 INFO  case.create ok tenant=acme external_id=evt-77 case_id=c-9001
