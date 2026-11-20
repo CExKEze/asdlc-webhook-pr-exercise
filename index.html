@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interview Exercise — Webhook Intake PR Review</title>
+<style>
+:root{
+  --ink:#1C005E;--accent:#7A2EE0;--muted:#5C5670;--line:rgba(28,0,94,.18);--line-strong:rgba(28,0,94,.32);
+  --red:#824038;--green:#0F5C3A;--font:Inter,Segoe UI,system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:#F7F5FA;color:var(--ink);line-height:1.45;padding:16px}
+.wrap{max-width:980px;margin:0 auto}
+h1{font-size:24px;font-weight:800;letter-spacing:-.02em;margin-bottom:6px}
+.sub{color:var(--muted);margin-bottom:14px;font-size:14.5px;max-width:70ch}
+.card{background:#fff;border:1px solid var(--line-strong);border-radius:12px;padding:14px 16px;margin-bottom:12px}
+h2{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
+h3{font-size:15px;font-weight:800;margin:12px 0 6px}
+p,li{font-size:14px;color:var(--muted);line-height:1.45}
+ul,ol{padding-left:18px}
+li{margin-bottom:4px}
+li strong{color:var(--ink)}
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.meta div{background:rgba(232,226,245,.45);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13.5px}
+.meta strong{color:var(--ink);display:block;margin-bottom:2px}
+pre{background:#1e1a2e;color:#e8e4f0;padding:14px 16px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.add{color:#7dcea0}.del{color:#f0a0a0}.ctx{color:#b8b4c8}.file{color:#c4b5fd;font-weight:700}
+.tag{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;background:rgba(122,46,224,.1);color:var(--accent);padding:3px 8px;border-radius:4px;margin-bottom:8px}
+@media (max-width:700px){.meta{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>PR review + bug triage</h1>
+  <p class="sub">You are reviewing a pull request that added “reliable” webhook intake for case creation. Production is seeing duplicate cases and occasional silent drops. AI tools and search are allowed. Think out loud; verify before you trust generated fixes.</p>
+
+  <div class="card">
+    <h2>Context</h2>
+    <div class="meta">
+      <div><strong>Service</strong> Node.js / TypeScript webhook intake → creates cases in a multi-tenant case-management API</div>
+      <div><strong>Symptom</strong> Support reports: (1) duplicate cases for the same external event, (2) some events never become cases though the vendor shows “delivered”</div>
+      <div><strong>Traffic</strong> ~20 events/min steady; occasional bursts. Vendors retry on non-2xx.</div>
+      <div><strong>Your job</strong> Triage the PR below: find root causes, propose/verify fixes, explain trade-offs. You do not need a running app — reason from the diff + logs.</div>
+    </div>
+    <h3>Suggested first moves</h3>
+    <ul>
+      <li>Bound the problem: what must be true for “no duplicates” and “no silent loss”?</li>
+      <li>Form hypotheses from the diff before rewriting large chunks.</li>
+      <li>Say what you would test or log to prove each fix.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Recent logs (scrubbed)</h2>
+    <pre>10:14:02 INFO  webhook.received tenant=acme delivery_id=d-1001 event=case.opened
+10:14:02 WARN  webhook.signature skipped=true reason=ALLOW_INSECURE_WEBHOOKS
+10:14:02 INFO  case.create ok tenant=acme external_id=evt-77 case_id=c-9001
+10:14:03 INFO  webhook.received tenant=acme delivery_id=d-1001 event=case.opened
+10:14:03 INFO  case.create ok tenant=acme external_id=evt-77 case_id=c-9002
+10:14:11 INFO  webhook.received tenant=globex delivery_id=d-2044 event=case.opened
+10:14:11 ERROR case.create upstream_status=503 tenant=globex external_id=evt-88
+10:14:11 INFO  webhook.respond status=200 body=ok
+10:14:40 INFO  vendor.retry delivery_id=d-2044 (not observed by our service)</pre>
+  </div>
+
+  <div class="card">
+    <span class="tag">PR #1842 — feat: resilient webhook intake</span>
+    <h2>Diff (abridged)</h2>
+
+    <h3>file: src/webhooks/verifySignature.ts</h3>
+    <pre><span class="file">@@ verifySignature.ts</span>
+<span class="ctx"> export function verifySignature(rawBody: Buffer, header: string | undefined, secret: string): boolean {</span>
+<span class="del">-  if (!header) return false;</span>
+<span class="add">+  if (process.env.ALLOW_INSECURE_WEBHOOKS === "true") {</span>
+<span class="add">+    return true; // unblock local testing</span>
+<span class="add">+  }</span>
+<span class="add">+  if (!header) return false;</span>
+<span class="ctx">   const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");</span>
+<span class="del">-  return crypto.timingSafeEqual(Buffer.from(header), Buffer.from(expected));</span>
+<span class="add">+  return header === expected;</span>
+<span class="ctx"> }</span></pre>
+
+    <h3>file: src/webhooks/intakeHandler.ts</h3>
+    <pre><span class="file">@@ intakeHandler.ts</span>
+<span class="ctx"> export async function intakeHandler(req: Request, res: Response) {</span>
+<span class="ctx">   const tenantId = String(req.headers["x-tenant-id"] || "");</span>
+<span class="ctx">   const deliveryId = String(req.headers["x-delivery-id"] || "");</span>
+<span class="ctx">   const rawBody = req.rawBody;</span>
+<span class="ctx"> </span>
+<span class="ctx">   if (!verifySignature(rawBody, req.headers["x-signature"] as string, secretFor(tenantId))) {</span>
+<span class="ctx">     return res.status(401).json({ error: "invalid signature" });</span>
+<span class="ctx">   }</span>
+<span class="ctx"> </span>
+<span class="add">+  // Fast path: avoid duplicate work on vendor retries</span>
+<span class="add">+  const seen = await redis.get(`delivery:${deliveryId}`);</span>
+<span class="add">+  if (seen) {</span>
+<span class="add">+    return res.status(200).json({ ok: true, deduped: true });</span>
+<span class="add">+  }</span>
+<span class="ctx"> </span>
+<span class="ctx">   const event = JSON.parse(rawBody.toString("utf8")) as WebhookEvent;</span>
+<span class="ctx"> </span>
+<span class="add">+  try {</span>
+<span class="ctx">     const caseId = await caseApi.create({</span>
+<span class="ctx">       tenantId,</span>
+<span class="ctx">       externalId: event.id,</span>
+<span class="ctx">       title: event.title,</span>
+<span class="ctx">       payload: event,</span>
+<span class="ctx">     });</span>
+<span class="add">+    await redis.set(`delivery:${deliveryId}`, caseId, "EX", 60); // 60s is enough for retries</span>
+<span class="add">+    return res.status(200).json({ ok: true, caseId });</span>
+<span class="add">+  } catch (err) {</span>
+<span class="add">+    logger.error("case.create", { err, tenantId, externalId: event.id });</span>
+<span class="add">+    // Always acknowledge so the vendor stops retrying noisy failures</span>
+<span class="add">+    return res.status(200).json({ ok: true });</span>
+<span class="add">+  }</span>
+<span class="ctx"> }</span></pre>
+
+    <h3>file: src/cases/caseApi.ts</h3>
+    <pre><span class="file">@@ caseApi.ts</span>
+<span class="ctx"> export async function create(input: CreateCaseInput): Promise&lt;string&gt; {</span>
+<span class="add">+  const existing = await db.cases.findFirst({</span>
+<span class="add">+    where: { tenantId: input.tenantId, externalId: input.externalId },</span>
+<span class="add">+  });</span>
+<span class="add">+  if (existing) return existing.id;</span>
+<span class="add">+</span>
+<span class="ctx">   const created = await db.cases.create({</span>
+<span class="ctx">     data: {</span>
+<span class="ctx">       tenantId: input.tenantId,</span>
+<span class="ctx">       externalId: input.externalId,</span>
+<span class="ctx">       title: input.title,</span>
+<span class="ctx">       payloadJson: JSON.stringify(input.payload),</span>
+<span class="ctx">     },</span>
+<span class="ctx">   });</span>
+<span class="ctx">   return created.id;</span>
+<span class="ctx"> }</span></pre>
+
+    <h3>file: src/webhooks/intakeHandler.test.ts (new)</h3>
+    <pre><span class="file">@@ intakeHandler.test.ts</span>
+<span class="add">+ it("returns 200 for valid webhook", async () => {</span>
+<span class="add">+   const res = await request(app)</span>
+<span class="add">+     .post("/webhooks/cases")</span>
+<span class="add">+     .set("x-tenant-id", "acme")</span>
+<span class="add">+     .set("x-delivery-id", "d-1")</span>
+<span class="add">+     .set("x-signature", "test")</span>
+<span class="add">+     .send({ id: "evt-1", title: "Hello" });</span>
+<span class="add">+   expect(res.status).toBe(200);</span>
+<span class="add">+ });</span></pre>
+  </div>
+
+  <div class="card">
+    <h2>Schema note</h2>
+    <pre>// db.cases — relevant indexes / constraints
+// tenantId  string
+// externalId string
+// @@index([tenantId, externalId])   // NOT unique</pre>
+  </div>
+
+  <div class="card">
+    <h2>When you are ready</h2>
+    <ol>
+      <li>List your top hypotheses (ordered).</li>
+      <li>Say which bug explains which symptom in the logs.</li>
+      <li>Propose the smallest safe fix path — and how you would prove it.</li>
+      <li>Call out any trade-offs you are making.</li>
+    </ol>
+  </div>
+</div>
+</body>
+</html>
